@@ -190,32 +190,55 @@ static const int8_t PATH[PATH_LEN][2] = {
   {0,3},{0,2},{0,1},   // step 13-15: 左辺 ↑
 };
 
-// ---- カラーパレット (NTT ブルー系) --------------------------------
-// 将来: g_heartRate に応じて動的に変更予定
+// ---- カラーパレット (心拍数 4段階: ブルー → シアン → オレンジ → レッド) ----
 
-static const CRGB COL_HEAD = CRGB(220, 245, 255);
-static const CRGB COL_TAIL[TAIL_LEN] = {
-  CRGB(  0, 190, 255),
-  CRGB(  0, 140, 230),
-  CRGB(  0,  90, 190),
-  CRGB(  0,  50, 140),
-  CRGB(  0,  22,  80),
-  CRGB(  0,   8,  30),
-  CRGB(  0,   2,   8),
+struct HRPalette {
+  CRGB head;
+  CRGB tail[TAIL_LEN];
+  CRGB bg;
 };
-static const CRGB COL_BG = CRGB(0, 0, 12);
+
+static const HRPalette PALETTES[4] = {
+  { // stage 0: 安静 < 70 bpm → ブルー (NTT カラー)
+    CRGB(220, 245, 255),
+    { CRGB(  0, 190, 255), CRGB(  0, 140, 230), CRGB(  0,  90, 190),
+      CRGB(  0,  50, 140), CRGB(  0,  22,  80), CRGB(  0,   8,  30),
+      CRGB(  0,   2,   8) },
+    CRGB(  0,   0,  12),
+  },
+  { // stage 1: 軽運動 70-89 bpm → シアン
+    CRGB(180, 255, 220),
+    { CRGB(  0, 230, 160), CRGB(  0, 180, 120), CRGB(  0, 120,  80),
+      CRGB(  0,  65,  40), CRGB(  0,  28,  16), CRGB(  0,  10,   5),
+      CRGB(  0,   3,   1) },
+    CRGB(  0,  10,   5),
+  },
+  { // stage 2: 運動 90-109 bpm → オレンジ
+    CRGB(255, 200,  50),
+    { CRGB(255, 110,   0), CRGB(220,  75,   0), CRGB(170,  45,   0),
+      CRGB(110,  22,   0), CRGB( 60,   8,   0), CRGB( 22,   2,   0),
+      CRGB(  6,   0,   0) },
+    CRGB( 10,   4,   0),
+  },
+  { // stage 3: 高強度 110+ bpm → レッド
+    CRGB(255, 100,  60),
+    { CRGB(255,  30,   0), CRGB(210,  12,   0), CRGB(160,   4,   0),
+      CRGB(100,   0,   0), CRGB( 55,   0,   0), CRGB( 20,   0,   0),
+      CRGB(  6,   0,   0) },
+    CRGB( 10,   0,   0),
+  },
+};
 
 // ============================================================
-// ---- 心拍数 → アニメーション速度 変換 -------------------------
+// ---- 心拍数 → ステージ変換 (速度・色を一括管理) ---------------
 // ============================================================
 
-// g_heartRate > 0 のとき呼ばれる
-// 将来: hrToColor() を追加して色連動も実装する想定
-static int hrToDelay(int bpm) {
-  if (bpm <  70) return 200;
-  if (bpm <  90) return 130;
-  if (bpm < 110) return  80;
-  return 50;
+// 戻り値 0-3 がそのまま PALETTES と SPEEDS のインデックスになる
+static int hrToStage(int bpm) {
+  if (bpm <  70) return 0;
+  if (bpm <  90) return 1;
+  if (bpm < 110) return 2;
+  return 3;
 }
 
 // ============================================================
@@ -228,12 +251,13 @@ static void setPixel(int x, int y, CRGB color) {
   M5.dis.drawpix(ledIdx(x, y), color);
 }
 
-static void drawComet(int head) {
+static void drawComet(int head, int stage) {
+  const HRPalette& pal = PALETTES[stage];
   for (int t = TAIL_LEN; t >= 1; t--) {
     int s = (head - t + PATH_LEN) % PATH_LEN;
-    setPixel(PATH[s][0], PATH[s][1], COL_TAIL[t - 1]);
+    setPixel(PATH[s][0], PATH[s][1], pal.tail[t - 1]);
   }
-  setPixel(PATH[head][0], PATH[head][1], COL_HEAD);
+  setPixel(PATH[head][0], PATH[head][1], pal.head);
 }
 
 // ============================================================
@@ -272,8 +296,10 @@ void loop() {
     speedIdx = (speedIdx + 1) % SPEED_NUM;
   }
 
-  // 速度決定: 心拍数あり → HR 連動、なし → 手動
-  int frameDelay = (g_heartRate > 0) ? hrToDelay(g_heartRate) : SPEEDS[speedIdx];
+  // ステージ決定: 心拍数あり → HR 連動、なし → 手動速度に対応するステージ
+  int stage = (g_heartRate > 0) ? hrToStage(g_heartRate) : speedIdx;
+  const HRPalette& pal = PALETTES[stage];
+  int frameDelay = SPEEDS[stage];
 
   // 1. 全消灯
   for (int i = 0; i < 25; i++) {
@@ -282,12 +308,12 @@ void loop() {
 
   // 2. 形状の輪郭を背景色で常時表示
   for (int i = 0; i < PATH_LEN; i++) {
-    setPixel(PATH[i][0], PATH[i][1], COL_BG);
+    setPixel(PATH[i][0], PATH[i][1], pal.bg);
   }
 
   // 3. 2個のコメットが追走 (offset = PATH_LEN/2 = 8)
-  drawComet((step + 8) % PATH_LEN);
-  drawComet(step % PATH_LEN);
+  drawComet((step + 8) % PATH_LEN, stage);
+  drawComet(step % PATH_LEN, stage);
 
   step++;
   delay(frameDelay);
