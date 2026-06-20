@@ -30,16 +30,25 @@
  *    .  [12] [11]  [10]   .
  *
  * ─────────────────────────────────────────────────────
- * 心拍数連動
+ * 心拍数連動 + キャリブレーション
  * ─────────────────────────────────────────────────────
  *
  * BLE で Xiaomi Smart Band 10 の心拍数共有 (標準 Heart Rate Profile) を受信。
  * g_heartRate が 0 (未接続/未取得) のときはボタンで速度切り替え (従来動作)。
- * g_heartRate > 0 のときは心拍数でアニメーション速度を自動制御。
+ * g_heartRate > 0 のときは心拍数でアニメーション速度・色を自動制御。
  *
- * 将来: g_heartRate を hrToColor() 等に渡してコメット色を変える想定。
+ * ステージ判定:
+ *   キャリブレーション未設定: 固定 BPM 閾値 (<70 / 70-89 / 90-109 / 110+)
+ *   キャリブレーション設定後: 基準値からの上昇率で判定
+ *     stage 0 (青)  :  0〜+14%   安静
+ *     stage 1 (シアン): +15〜+34%  軽運動
+ *     stage 2 (橙)  : +35〜+54%  中強度
+ *     stage 3 (赤)  : +55%〜     高強度
  *
- * ボタン: BLE 未接続時の速度切り替え
+ * ボタン:
+ *   BLE 接続中  → 現在の心拍数をキャリブレーション基準値として記録
+ *                 (LEDが白く点滅してフィードバック)
+ *   BLE 未接続時 → 手動速度切り替え
  */
 
 #include "M5Atom.h"
@@ -62,6 +71,7 @@ static const NimBLEAddress TARGET_ADDR(std::string(BAND_BLE_ADDR), 1);
 // 他タスク (BLE コールバック) から書き込まれるため volatile
 static volatile int  g_heartRate  = 0;   // bpm (0 = 未取得)
 static volatile bool g_connected  = false;
+static volatile int  g_hrBaseline = 0;   // キャリブレーション基準値 (0 = 未設定)
 
 static bool          g_doConnect  = false;
 static NimBLEAddress g_foundAddr;         // スキャンで実際に見つけたアドレス (type 込み)
@@ -235,6 +245,15 @@ static const HRPalette PALETTES[4] = {
 
 // 戻り値 0-3 がそのまま PALETTES と SPEEDS のインデックスになる
 static int hrToStage(int bpm) {
+  if (g_hrBaseline > 0) {
+    // キャリブレーション済み: 基準値からの上昇率 (%) で判定
+    int pct = (bpm - g_hrBaseline) * 100 / g_hrBaseline;
+    if (pct < 15) return 0;
+    if (pct < 35) return 1;
+    if (pct < 55) return 2;
+    return 3;
+  }
+  // 未キャリブレーション: 固定 BPM 閾値
   if (bpm <  70) return 0;
   if (bpm <  90) return 1;
   if (bpm < 110) return 2;
@@ -291,9 +310,19 @@ void loop() {
     connectToHRDevice();
   }
 
-  // ボタン: BLE 未接続時のみ手動速度切り替え
-  if (M5.Btn.wasPressed() && !g_connected) {
-    speedIdx = (speedIdx + 1) % SPEED_NUM;
+  // ボタン: BLE 接続中 → キャリブレーション、未接続時 → 手動速度切り替え
+  if (M5.Btn.wasPressed()) {
+    if (g_connected && g_heartRate > 0) {
+      g_hrBaseline = g_heartRate;
+      Serial.print("[CAL] Baseline set to ");
+      Serial.print(g_hrBaseline);
+      Serial.println(" bpm");
+      // 白点滅でキャリブレーション完了をフィードバック
+      for (int i = 0; i < 25; i++) M5.dis.drawpix(i, CRGB::White);
+      delay(200);
+    } else if (!g_connected) {
+      speedIdx = (speedIdx + 1) % SPEED_NUM;
+    }
   }
 
   // ステージ決定: 心拍数あり → HR 連動、なし → 手動速度に対応するステージ
