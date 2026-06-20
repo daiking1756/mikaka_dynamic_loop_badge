@@ -1,0 +1,10 @@
+# 個人設定ファイル (BLE アドレス等の秘匿情報)
+src/dynamic-loop/config.h
+
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# macOS
+.DS_Store

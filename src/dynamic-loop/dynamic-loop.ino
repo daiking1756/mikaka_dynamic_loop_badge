@@ -1,5 +1,5 @@
 /**
- * NTT ダイナミックループ アニメーション
+ * NTT ダイナミックループ アニメーション + 心拍数連動
  * ATOM Matrix (M5Stack) 5×5 LED Matrix
  *
  * 形状:
@@ -22,13 +22,6 @@
  *   step 5: (2,0)  ← ↗ で交差点に戻る = 小ループ一周完了!
  *   step 6: (3,0)  ← 交差点から上右へ抜ける
  *
- * step 5 (2,0) に HEAD が到達した瞬間、
- * TAIL=7 なら HEAD+TAIL の 8ピクセルが小ループを完全に照らす:
- *   (0,2)-(0,3)-(1,0)-(2,0)-(3,1)-(2,2)-(1,1)-(2,0)
- *   ※(2,0) は HEAD と tail-4 が重なり → HEAD色で最高輝度に点灯 (交差の光)
- *
- * その後 step 6〜15 で外周 (上右→右辺↓→下辺←→左辺↑) を反時計回り。
- *
  * ステップ番号マップ ((2,0) は [1,5] と表記):
  *   .   [0]  [1,5]  [6]   .
  *   [15] [4]   .    [2]   [7]
@@ -36,34 +29,156 @@
  *   [13]  .    .     .    [9]
  *    .  [12] [11]  [10]   .
  *
- * ボタン: 速度切り替え
+ * ─────────────────────────────────────────────────────
+ * 心拍数連動
+ * ─────────────────────────────────────────────────────
+ *
+ * BLE で Xiaomi Smart Band 10 の心拍数共有 (標準 Heart Rate Profile) を受信。
+ * g_heartRate が 0 (未接続/未取得) のときはボタンで速度切り替え (従来動作)。
+ * g_heartRate > 0 のときは心拍数でアニメーション速度を自動制御。
+ *
+ * 将来: g_heartRate を hrToColor() 等に渡してコメット色を変える想定。
+ *
+ * ボタン: BLE 未接続時の速度切り替え
  */
 
 #include "M5Atom.h"
+#include <NimBLEDevice.h>
+#include "config.h"  // BAND_BLE_ADDR を定義 (GitHub 非公開)
 
-// ---- 定数 ----------------------------------------------------------------
+// ============================================================
+// ---- BLE 設定 -----------------------------------------------
+// ============================================================
+
+// 標準 Heart Rate Profile (Bluetooth SIG 標準 UUID)
+#define HR_SERVICE_UUID  "0000180d-0000-1000-8000-00805f9b34fb"
+#define HR_CHAR_UUID     "00002a37-0000-1000-8000-00805f9b34fb"
+
+// Xiaomi Smart Band 10 の BLE 広告アドレス (config.h で定義)
+// ※ BLE では Static Random Address (type=1) で広告するため nRF Toolbox 表示値を使用
+// v2.x: コンストラクタは (std::string, uint8_t type) の2引数が必要
+static const NimBLEAddress TARGET_ADDR(std::string(BAND_BLE_ADDR), 1);
+
+// 他タスク (BLE コールバック) から書き込まれるため volatile
+static volatile int  g_heartRate  = 0;   // bpm (0 = 未取得)
+static volatile bool g_connected  = false;
+
+static bool          g_doConnect  = false;
+static NimBLEAddress g_foundAddr;         // スキャンで実際に見つけたアドレス (type 込み)
+static NimBLEClient* g_client     = nullptr;
+
+// ---- HR 通知コールバック ----------------------------------------
+// Heart Rate Measurement 特性 (0x2A37) のフォーマット:
+//   byte 0: Flags  bit0=0 → HR は uint8、bit0=1 → HR は uint16
+//   byte 1 (or 1-2): HR 値
+static void hrNotifyCallback(NimBLERemoteCharacteristic*, uint8_t* data, size_t len, bool) {
+  if (len < 2) return;
+  g_heartRate = (data[0] & 0x01) ? (int)(data[1] | (data[2] << 8)) : (int)data[1];
+  Serial.print("[HR] ");
+  Serial.print(g_heartRate);
+  Serial.println(" bpm");
+}
+
+// ---- BLE 接続状態コールバック (NimBLE-Arduino v2.x API) ----------
+class ClientCB : public NimBLEClientCallbacks {
+  void onConnect(NimBLEClient* client) override {
+    g_connected = true;
+    Serial.print("[BLE] Connected: ");
+    Serial.println(client->getPeerAddress().toString().c_str());
+  }
+  // v2.x: 切断理由コード (reason) が追加された
+  void onDisconnect(NimBLEClient* client, int reason) override {
+    g_connected  = false;
+    g_heartRate  = 0;
+    g_doConnect  = false;
+    Serial.print("[BLE] Disconnected, reason=");
+    Serial.println(reason);
+    NimBLEDevice::getScan()->start(0);
+  }
+};
+
+// ---- BLE スキャンコールバック (NimBLE-Arduino v2.x API) ----------
+class ScanCB : public NimBLEScanCallbacks {
+  void onResult(const NimBLEAdvertisedDevice* dev) override {
+    // 全デバイスを表示: Smart Band 10 の MAC と address type を確認する
+    Serial.print("[SCAN] addr=");
+    Serial.print(dev->getAddress().toString().c_str());
+    Serial.print(" type=");
+    Serial.print(dev->getAddress().getType());
+    Serial.print(" rssi=");
+    Serial.println(dev->getRSSI());
+
+    // アドレス文字列だけで比較 (type を無視)
+    if (dev->getAddress().toString() == std::string(BAND_BLE_ADDR)) {
+      Serial.print("[BLE] Smart Band 10 found! type=");
+      Serial.println(dev->getAddress().getType());
+      g_foundAddr = dev->getAddress();  // type 込みで保存
+      NimBLEDevice::getScan()->stop();
+      g_doConnect = true;
+    }
+  }
+};
+
+// ---- デバイスへの接続 -------------------------------------------
+static void connectToHRDevice() {
+  Serial.println("[BLE] Connecting to Smart Band 10...");
+
+  g_client = NimBLEDevice::createClient();
+  g_client->setClientCallbacks(new ClientCB(), false);
+
+  if (!g_client->connect(g_foundAddr)) {
+    Serial.println("[BLE] Connect failed, restarting scan");
+    NimBLEDevice::deleteClient(g_client);
+    g_client = nullptr;
+    NimBLEDevice::getScan()->start(0);
+    return;
+  }
+
+  auto* svc = g_client->getService(HR_SERVICE_UUID);
+  if (!svc) {
+    Serial.println("[BLE] HR service not found");
+    g_client->disconnect();
+    return;
+  }
+
+  auto* chr = svc->getCharacteristic(HR_CHAR_UUID);
+  if (!chr || !chr->canNotify()) {
+    Serial.println("[BLE] HR characteristic not found or not notifiable");
+    g_client->disconnect();
+    return;
+  }
+
+  chr->subscribe(true, hrNotifyCallback);
+  Serial.println("[BLE] Subscribed to HR notifications");
+}
+
+// ---- BLE 初期化 -------------------------------------------------
+static void bleSetup() {
+  NimBLEDevice::init("");
+  Serial.println("[BLE] Scanning for HR device...");
+
+  auto* scan = NimBLEDevice::getScan();
+  // v2.x: setAdvertisedDeviceCallbacks → setScanCallbacks
+  scan->setScanCallbacks(new ScanCB());
+  scan->setActiveScan(true);
+  scan->setInterval(45);
+  scan->setWindow(15);
+  scan->start(0);  // 0 = 無限スキャン
+}
+
+// ============================================================
+// ---- LED アニメーション定数 -----------------------------------
+// ============================================================
 
 static constexpr int PATH_LEN = 16;
 static constexpr int TAIL_LEN = 7;
 
+// ボタンで切り替える手動速度 (BLE 未接続時のフォールバック)
 static const int SPEEDS[]  = {200, 130, 80, 50};
 static const int SPEED_NUM = 4;
 
-// ---- 一筆書き経路 ----------------------------------------------------------
+// ---- 一筆書き経路 -----------------------------------------------
 
-/**
- * 図8経路: PATH_LEN=16 ((2,0) を交差点として2回通過)
- *
- * 内側を時計回りに ↘↙↖↗ と一周:
- *   step1=(2,0) → ↘ → step2=(3,1) → ↙ → step3=(2,2)
- *               → ↖ → step4=(1,1) → ↗ → step5=(2,0) [交差点に戻る]
- *
- * 隣接チェック (距離 ≤ √2):
- *   (1,0)↔(2,0)=1,  (2,0)↔(3,1)=√2, (3,1)↔(2,2)=√2, (2,2)↔(1,1)=√2,
- *   (1,1)↔(2,0)=√2, (2,0)↔(3,0)=1,  (3,0)↔(4,1)=√2, (4,1)↔(4,2)=1,
- *   (4,2)↔(4,3)=1,  (4,3)↔(3,4)=√2, (3,4)↔(2,4)=1,  (2,4)↔(1,4)=1,
- *   (1,4)↔(0,3)=√2, (0,3)↔(0,2)=1,  (0,2)↔(0,1)=1,  (0,1)↔(1,0)=√2 ← 閉じる ✓
- */
 static const int8_t PATH[PATH_LEN][2] = {
   {1,0},               // step  0: 上左 ← スタート
   {2,0},               // step  1: 上中央 (交差点 進入)
@@ -73,32 +188,45 @@ static const int8_t PATH[PATH_LEN][2] = {
   {4,1},{4,2},{4,3},   // step  7- 9: 右辺 ↓
   {3,4},{2,4},{1,4},   // step 10-12: 下辺 ←
   {0,3},{0,2},{0,1},   // step 13-15: 左辺 ↑
-  // → (1,0) へ戻る (距離 √2)
 };
 
-// ---- カラーパレット (NTT ブルー系) ----------------------------------------
+// ---- カラーパレット (NTT ブルー系) --------------------------------
+// 将来: g_heartRate に応じて動的に変更予定
 
-static const CRGB COL_HEAD    = CRGB(220, 245, 255);
+static const CRGB COL_HEAD = CRGB(220, 245, 255);
 static const CRGB COL_TAIL[TAIL_LEN] = {
-  CRGB(  0, 190, 255),   // tail-1
-  CRGB(  0, 140, 230),   // tail-2
-  CRGB(  0,  90, 190),   // tail-3
-  CRGB(  0,  50, 140),   // tail-4
-  CRGB(  0,  22,  80),   // tail-5
-  CRGB(  0,   8,  30),   // tail-6
-  CRGB(  0,   2,   8),   // tail-7
+  CRGB(  0, 190, 255),
+  CRGB(  0, 140, 230),
+  CRGB(  0,  90, 190),
+  CRGB(  0,  50, 140),
+  CRGB(  0,  22,  80),
+  CRGB(  0,   8,  30),
+  CRGB(  0,   2,   8),
 };
 static const CRGB COL_BG = CRGB(0, 0, 12);
 
-// ---- ユーティリティ -------------------------------------------------------
+// ============================================================
+// ---- 心拍数 → アニメーション速度 変換 -------------------------
+// ============================================================
+
+// g_heartRate > 0 のとき呼ばれる
+// 将来: hrToColor() を追加して色連動も実装する想定
+static int hrToDelay(int bpm) {
+  if (bpm <  70) return 200;
+  if (bpm <  90) return 130;
+  if (bpm < 110) return  80;
+  return 50;
+}
+
+// ============================================================
+// ---- ユーティリティ / 描画 ------------------------------------
+// ============================================================
 
 static inline int ledIdx(int x, int y) { return y * 5 + x; }
 
 static void setPixel(int x, int y, CRGB color) {
   M5.dis.drawpix(ledIdx(x, y), color);
 }
-
-// ---- コメット描画 ---------------------------------------------------------
 
 static void drawComet(int head) {
   for (int t = TAIL_LEN; t >= 1; t--) {
@@ -108,25 +236,44 @@ static void drawComet(int head) {
   setPixel(PATH[head][0], PATH[head][1], COL_HEAD);
 }
 
-// ---- グローバル状態 -------------------------------------------------------
+// ============================================================
+// ---- グローバル状態 -------------------------------------------
+// ============================================================
 
 static int step     = 0;
 static int speedIdx = 1;
 
-// ---- Arduino エントリポイント --------------------------------------------
+// ============================================================
+// ---- Arduino エントリポイント ---------------------------------
+// ============================================================
 
 void setup() {
+  Serial.begin(115200);
+  delay(1500);  // シリアルモニタが接続されるのを待つ
+  Serial.println("=== Dynamic Loop Badge starting ===");
+
   M5.begin(true, false, true);
   delay(50);
   M5.dis.setBrightness(50);
+  bleSetup();
 }
 
 void loop() {
   M5.update();
 
-  if (M5.Btn.wasPressed()) {
+  // BLE 接続要求の処理 (スキャンコールバックから設定される)
+  if (g_doConnect) {
+    g_doConnect = false;
+    connectToHRDevice();
+  }
+
+  // ボタン: BLE 未接続時のみ手動速度切り替え
+  if (M5.Btn.wasPressed() && !g_connected) {
     speedIdx = (speedIdx + 1) % SPEED_NUM;
   }
+
+  // 速度決定: 心拍数あり → HR 連動、なし → 手動
+  int frameDelay = (g_heartRate > 0) ? hrToDelay(g_heartRate) : SPEEDS[speedIdx];
 
   // 1. 全消灯
   for (int i = 0; i < 25; i++) {
@@ -138,11 +285,10 @@ void loop() {
     setPixel(PATH[i][0], PATH[i][1], COL_BG);
   }
 
-  // 3. 2個のコメットが一筆書き経路を追走 (offset = PATH_LEN/2 = 8)
-  //    各コメットが head+tail7 の8ステップを占め、全16ステップをピッタリ分担
-  drawComet((step + 8) % PATH_LEN);  // 先行コメット (先に描画 = 後続に上書きされる)
-  drawComet(step % PATH_LEN);         // 後続コメット
+  // 3. 2個のコメットが追走 (offset = PATH_LEN/2 = 8)
+  drawComet((step + 8) % PATH_LEN);
+  drawComet(step % PATH_LEN);
 
   step++;
-  delay(SPEEDS[speedIdx]);
+  delay(frameDelay);
 }
