@@ -345,9 +345,15 @@ static void updateHexDisplay(int stage, int stepNum, uint8_t dimVal) {
 // ---- グローバル状態 -------------------------------------------
 // ============================================================
 
-static int step        = 0;
-static int speedIdx    = 1;
-static int pulseFrames = 0;  // ビートパルス残りフレーム数 (0=通常)
+static int      step        = 0;
+static int      speedIdx    = 1;
+static int      pulseFrames = 0;   // ビートパルス残りフレーム数 (0=通常)
+static int      hexStep     = 0;   // HEX ボード独立ステップカウンタ
+static uint32_t hexLastMs   = 0;   // HEX ボード最終更新時刻 (ms)
+
+// HEX ボードの速度倍率 (ATOM Matrix の frameDelay に対する比率 × 256)
+// 384 = 1.5倍遅い。大きいほどゆっくり。
+static constexpr uint16_t HEX_SPEED_SCALE = 32;
 
 // ============================================================
 // ---- Arduino エントリポイント ---------------------------------
@@ -404,9 +410,17 @@ void loop() {
   if (pulseFrames > 0) pulseFrames--;
   M5.dis.setBrightness(atomBright);
 
-  // HEX ボードを drawpix より前に更新
+  // HEX ボードを drawpix より前に更新 (独立速度)
   // (drawpix 内の FastLED.show() で HEX にも反映される)
-  updateHexDisplay(stage, step, hexDimVal);
+  {
+    uint32_t now = millis();
+    uint32_t hexInterval = (uint32_t)frameDelay * HEX_SPEED_SCALE / 256;
+    if (now - hexLastMs >= hexInterval) {
+      hexLastMs = now;
+      hexStep++;
+    }
+    updateHexDisplay(stage, hexStep, hexDimVal);
+  }
 
   // 1. 全消灯
   for (int i = 0; i < 25; i++) {
