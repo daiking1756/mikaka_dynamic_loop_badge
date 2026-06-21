@@ -56,6 +56,16 @@
 #include "config.h"  // BAND_BLE_ADDR を定義 (GitHub 非公開)
 
 // ============================================================
+// ---- HEX NeoPixel ボード (M5Stack HEX, 37LED) ---------------
+// ============================================================
+// Grove Pin3 (白線) = GPIO 26 をデータ線として使用
+// 電源 (5V/GND) は Grove の赤/黒線をそのまま使用
+#define HEX_PIN      26
+#define HEX_NUM_LEDS 37
+
+static CRGB hexLeds[HEX_NUM_LEDS];
+
+// ============================================================
 // ---- BLE 設定 -----------------------------------------------
 // ============================================================
 
@@ -279,6 +289,56 @@ static void drawComet(int head, int stage) {
   setPixel(PATH[head][0], PATH[head][1], pal.head);
 }
 
+// HEX ボード用アニメーション定数
+//
+// HEX ボードの LED 番号は行スキャン順と仮定:
+//   Row0(4): 0- 3   Row1(5): 4- 8   Row2(6): 9-14
+//   Row3(7):15-21   Row4(6):22-27   Row5(5):28-32   Row6(4):33-36
+//
+// 内側ループの各折り返し点の角度を最大 63° に抑えて円に近い楕円形に。
+// LED 1 が交差点 (2回登場)。
+static constexpr uint8_t HEX_PATH_LEN = 26;
+static const uint8_t HEX_PATH[HEX_PATH_LEN] = {
+   0,  1,  2,  7, 13, 19, 18, 17, 10,  5,
+   1,  3,  8, 14, 21, 27, 32, 36, 35, 34,
+  33, 28, 22, 15,  9,  4,
+};
+
+// HEX ボードのテール長 (ATOM Matrix の TAIL_LEN=7 より長くしてリッチな見た目に)
+static constexpr uint8_t HEX_TAIL_LEN = 13;
+
+// HEX ボードの輝度スケール (ATOM Matrix より暗く)
+static constexpr uint8_t HEX_DIM = 30;
+
+// HEX ボード上で ATOM Matrix と同じ図8軌跡を描くアニメーション
+// drawpix より前に呼ぶこと (drawpix 内の FastLED.show() で同時に反映される)
+static void updateHexDisplay(int stage, int stepNum) {
+  const HRPalette& pal = PALETTES[stage];
+
+  // 全消灯してから輪郭を背景色で描画
+  fill_solid(hexLeds, HEX_NUM_LEDS, CRGB::Black);
+  for (int i = 0; i < HEX_PATH_LEN; i++) {
+    hexLeds[HEX_PATH[i]] = pal.bg;
+  }
+
+  // 2個のコメットが追走 (オフセット = HEX_PATH_LEN/2 = 13)
+  for (int c = 0; c < 2; c++) {
+    int head = ((stepNum % HEX_PATH_LEN) + c * (HEX_PATH_LEN / 2)) % HEX_PATH_LEN;
+    for (int t = HEX_TAIL_LEN; t >= 1; t--) {
+      int s = (head - t + HEX_PATH_LEN) % HEX_PATH_LEN;
+      // t > TAIL_LEN の延長部分は最も暗いテール色をそのまま使う
+      int palIdx = (t <= TAIL_LEN) ? (t - 1) : (TAIL_LEN - 1);
+      hexLeds[HEX_PATH[s]] = pal.tail[palIdx];
+    }
+    hexLeds[HEX_PATH[head]] = pal.head;
+  }
+
+  // HEX ボード全体を暗くする (ATOM Matrix と輝度を分ける)
+  for (int i = 0; i < HEX_NUM_LEDS; i++) {
+    hexLeds[i].nscale8(HEX_DIM);
+  }
+}
+
 // ============================================================
 // ---- グローバル状態 -------------------------------------------
 // ============================================================
@@ -297,7 +357,8 @@ void setup() {
 
   M5.begin(true, false, true);
   delay(50);
-  M5.dis.setBrightness(50);
+  M5.dis.setBrightness(100);
+  FastLED.addLeds<WS2812B, HEX_PIN, GRB>(hexLeds, HEX_NUM_LEDS);
   bleSetup();
 }
 
@@ -329,6 +390,10 @@ void loop() {
   int stage = (g_heartRate > 0) ? hrToStage(g_heartRate) : speedIdx;
   const HRPalette& pal = PALETTES[stage];
   int frameDelay = SPEEDS[stage];
+
+  // HEX ボードを drawpix より前に更新
+  // (drawpix 内の FastLED.show() で HEX にも反映される)
+  updateHexDisplay(stage, step);
 
   // 1. 全消灯
   for (int i = 0; i < 25; i++) {
