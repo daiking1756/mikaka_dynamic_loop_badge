@@ -82,6 +82,7 @@ static const NimBLEAddress TARGET_ADDR(std::string(BAND_BLE_ADDR), 1);
 static volatile int  g_heartRate  = 0;   // bpm (0 = 未取得)
 static volatile bool g_connected  = false;
 static volatile int  g_hrBaseline = 0;   // キャリブレーション基準値 (0 = 未設定)
+static volatile bool g_beatPulse  = false; // 心拍通知到着フラグ (loop() で消費)
 
 static bool          g_doConnect  = false;
 static NimBLEAddress g_foundAddr;         // スキャンで実際に見つけたアドレス (type 込み)
@@ -94,6 +95,7 @@ static NimBLEClient* g_client     = nullptr;
 static void hrNotifyCallback(NimBLERemoteCharacteristic*, uint8_t* data, size_t len, bool) {
   if (len < 2) return;
   g_heartRate = (data[0] & 0x01) ? (int)(data[1] | (data[2] << 8)) : (int)data[1];
+  g_beatPulse = true;  // ビートパルストリガー
   Serial.print("[HR] ");
   Serial.print(g_heartRate);
   Serial.println(" bpm");
@@ -312,7 +314,7 @@ static constexpr uint8_t HEX_DIM = 30;
 
 // HEX ボード上で ATOM Matrix と同じ図8軌跡を描くアニメーション
 // drawpix より前に呼ぶこと (drawpix 内の FastLED.show() で同時に反映される)
-static void updateHexDisplay(int stage, int stepNum) {
+static void updateHexDisplay(int stage, int stepNum, uint8_t dimVal) {
   const HRPalette& pal = PALETTES[stage];
 
   // 全消灯してから輪郭を背景色で描画
@@ -335,7 +337,7 @@ static void updateHexDisplay(int stage, int stepNum) {
 
   // HEX ボード全体を暗くする (ATOM Matrix と輝度を分ける)
   for (int i = 0; i < HEX_NUM_LEDS; i++) {
-    hexLeds[i].nscale8(HEX_DIM);
+    hexLeds[i].nscale8(dimVal);
   }
 }
 
@@ -343,8 +345,9 @@ static void updateHexDisplay(int stage, int stepNum) {
 // ---- グローバル状態 -------------------------------------------
 // ============================================================
 
-static int step     = 0;
-static int speedIdx = 1;
+static int step        = 0;
+static int speedIdx    = 1;
+static int pulseFrames = 0;  // ビートパルス残りフレーム数 (0=通常)
 
 // ============================================================
 // ---- Arduino エントリポイント ---------------------------------
@@ -391,9 +394,19 @@ void loop() {
   const HRPalette& pal = PALETTES[stage];
   int frameDelay = SPEEDS[stage];
 
+  // ビートパルス: 心拍通知到着時に数フレームだけ輝度を上げる
+  if (g_beatPulse) {
+    g_beatPulse   = false;
+    pulseFrames   = 4;  // 輝度アップを維持するフレーム数
+  }
+  uint8_t atomBright = (pulseFrames > 0) ? 200 : 100;
+  uint8_t hexDimVal  = (pulseFrames > 0) ? 80  : HEX_DIM;
+  if (pulseFrames > 0) pulseFrames--;
+  M5.dis.setBrightness(atomBright);
+
   // HEX ボードを drawpix より前に更新
   // (drawpix 内の FastLED.show() で HEX にも反映される)
-  updateHexDisplay(stage, step);
+  updateHexDisplay(stage, step, hexDimVal);
 
   // 1. 全消灯
   for (int i = 0; i < 25; i++) {
