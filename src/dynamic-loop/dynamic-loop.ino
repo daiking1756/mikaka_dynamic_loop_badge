@@ -56,12 +56,14 @@
 #include "config.h"  // BAND_BLE_ADDR を定義 (GitHub 非公開)
 
 // ============================================================
-// ---- HEX NeoPixel ボード (M5Stack HEX, 37LED) ---------------
+// ---- LED テープ (WS2813B, 60LED) ----------------------------
 // ============================================================
-// Grove Pin3 (白線) = GPIO 26 をデータ線として使用
+// Grove 黄線 (G32) をデータ線として使用
+// ※ G26 (白線) で光らない場合はこちらが正解
 // 電源 (5V/GND) は Grove の赤/黒線をそのまま使用
-#define HEX_PIN      26
-#define HEX_NUM_LEDS 37
+// WS2813B は WS2812B とプロトコル互換
+#define HEX_PIN      32
+#define HEX_NUM_LEDS 60
 
 static CRGB hexLeds[HEX_NUM_LEDS];
 
@@ -261,8 +263,8 @@ static int hrToStage(int bpm) {
     // キャリブレーション済み: 基準値からの上昇率 (%) で判定
     int pct = (bpm - g_hrBaseline) * 100 / g_hrBaseline;
     if (pct < 15) return 0;
-    if (pct < 35) return 1;
-    if (pct < 55) return 2;
+    if (pct < 30) return 1;
+    if (pct < 45) return 2;
     return 3;
   }
   // 未キャリブレーション: 固定 BPM 閾値
@@ -291,53 +293,48 @@ static void drawComet(int head, int stage) {
   setPixel(PATH[head][0], PATH[head][1], pal.head);
 }
 
-// HEX ボード用アニメーション定数
-//
-// HEX ボードの LED 番号は行スキャン順と仮定:
-//   Row0(4): 0- 3   Row1(5): 4- 8   Row2(6): 9-14
-//   Row3(7):15-21   Row4(6):22-27   Row5(5):28-32   Row6(4):33-36
-//
-// 内側ループの各折り返し点の角度を最大 63° に抑えて円に近い楕円形に。
-// LED 1 が交差点 (2回登場)。
-static constexpr uint8_t HEX_PATH_LEN = 26;
-static const uint8_t HEX_PATH[HEX_PATH_LEN] = {
-   0,  1,  2,  7, 13, 19, 18, 17, 10,  5,
-   1,  3,  8, 14, 21, 27, 32, 36, 35, 34,
-  33, 28, 22, 15,  9,  4,
-};
+// ---- LED テープ用アニメーション ------------------------------------
+// 白ベースライト上をカラーのコメットが一方向に巡回 (テープはループ状)
+// drawpix より前に呼ぶこと (drawpix 内の FastLED.show() でテープにも反映)
 
-// HEX ボードのテール長 (ATOM Matrix の TAIL_LEN=7 より長くしてリッチな見た目に)
-static constexpr uint8_t HEX_TAIL_LEN = 13;
+static constexpr uint8_t TAPE_TAIL_LEN = 12;  // コメットのテール長
+static constexpr uint8_t TAPE_BG       = 40;  // 白ベースライトの輝度
 
-// HEX ボードの輝度スケール (ATOM Matrix より暗く)
-static constexpr uint8_t HEX_DIM = 30;
-
-// HEX ボード上で ATOM Matrix と同じ図8軌跡を描くアニメーション
-// drawpix より前に呼ぶこと (drawpix 内の FastLED.show() で同時に反映される)
-static void updateHexDisplay(int stage, int stepNum, uint8_t dimVal) {
+static void updateTapeDisplay(int stage, uint32_t now) {
   const HRPalette& pal = PALETTES[stage];
 
-  // 全消灯してから輪郭を背景色で描画
-  fill_solid(hexLeds, HEX_NUM_LEDS, CRGB::Black);
-  for (int i = 0; i < HEX_PATH_LEN; i++) {
-    hexLeds[HEX_PATH[i]] = pal.bg;
+  // ATOM Matrix の 2倍速でテープを進める
+  // while で複数ステップを一括処理し、loop() の delay に依存しない独立タイミングを実現
+  static uint32_t tapeLastMs = 0;
+  static int      tapeStep   = 0;
+  const uint32_t  interval   = (uint32_t)SPEEDS[stage] / 2;
+  while (now - tapeLastMs >= interval) {
+    tapeLastMs += interval;
+    tapeStep++;
   }
 
-  // 2個のコメットが追走 (オフセット = HEX_PATH_LEN/2 = 13)
+  // 全 LED を薄い白で点灯 (ベースライト)
+  fill_solid(hexLeds, HEX_NUM_LEDS, CRGB(TAPE_BG, TAPE_BG, TAPE_BG));
+
+  // 2個のコメットが一方向に巡回 (オフセット = 30)
   for (int c = 0; c < 2; c++) {
-    int head = ((stepNum % HEX_PATH_LEN) + c * (HEX_PATH_LEN / 2)) % HEX_PATH_LEN;
-    for (int t = HEX_TAIL_LEN; t >= 1; t--) {
-      int s = (head - t + HEX_PATH_LEN) % HEX_PATH_LEN;
-      // t > TAIL_LEN の延長部分は最も暗いテール色をそのまま使う
-      int palIdx = (t <= TAIL_LEN) ? (t - 1) : (TAIL_LEN - 1);
-      hexLeds[HEX_PATH[s]] = pal.tail[palIdx];
-    }
-    hexLeds[HEX_PATH[head]] = pal.head;
-  }
+    int head = (tapeStep + c * (HEX_NUM_LEDS / 2)) % HEX_NUM_LEDS;
 
-  // HEX ボード全体を暗くする (ATOM Matrix と輝度を分ける)
-  for (int i = 0; i < HEX_NUM_LEDS; i++) {
-    hexLeds[i].nscale8(dimVal);
+    // テール: 輝度を 1.56倍にブーストし、ベースライト以上に保って描画
+    for (int t = TAPE_TAIL_LEN; t >= 1; t--) {
+      int  pos    = (head - t + HEX_NUM_LEDS) % HEX_NUM_LEDS;
+      int  palIdx = (t - 1) * (TAIL_LEN - 1) / (TAPE_TAIL_LEN - 1);
+      CRGB tc     = pal.tail[palIdx];
+      tc.r = (uint8_t)min(255, (int)tc.r * 2);
+      tc.g = (uint8_t)min(255, (int)tc.g * 2);
+      tc.b = (uint8_t)min(255, (int)tc.b * 2);
+      hexLeds[pos].r = max(tc.r, TAPE_BG);
+      hexLeds[pos].g = max(tc.g, TAPE_BG);
+      hexLeds[pos].b = max(tc.b, TAPE_BG);
+    }
+
+    // ヘッド (最も明るく)
+    hexLeds[head] = pal.head;
   }
 }
 
@@ -345,15 +342,9 @@ static void updateHexDisplay(int stage, int stepNum, uint8_t dimVal) {
 // ---- グローバル状態 -------------------------------------------
 // ============================================================
 
-static int      step        = 0;
-static int      speedIdx    = 1;
-static int      pulseFrames = 0;   // ビートパルス残りフレーム数 (0=通常)
-static int      hexStep     = 0;   // HEX ボード独立ステップカウンタ
-static uint32_t hexLastMs   = 0;   // HEX ボード最終更新時刻 (ms)
-
-// HEX ボードの速度倍率 (ATOM Matrix の frameDelay に対する比率 × 256)
-// 384 = 1.5倍遅い。大きいほどゆっくり。
-static constexpr uint16_t HEX_SPEED_SCALE = 32;
+static int  step        = 0;
+static int  speedIdx    = 1;
+static int  pulseFrames = 0;  // ビートパルス残りフレーム数 (0=通常)
 
 // ============================================================
 // ---- Arduino エントリポイント ---------------------------------
@@ -367,7 +358,7 @@ void setup() {
   M5.begin(true, false, true);
   delay(50);
   M5.dis.setBrightness(100);
-  FastLED.addLeds<WS2812B, HEX_PIN, GRB>(hexLeds, HEX_NUM_LEDS);
+  FastLED.addLeds<WS2812B, HEX_PIN, GRB>(hexLeds, HEX_NUM_LEDS);  // WS2813B はプロトコル互換
   bleSetup();
 }
 
@@ -406,20 +397,14 @@ void loop() {
     pulseFrames   = 4;  // 輝度アップを維持するフレーム数
   }
   uint8_t atomBright = (pulseFrames > 0) ? 200 : 100;
-  uint8_t hexDimVal  = (pulseFrames > 0) ? 80  : HEX_DIM;
   if (pulseFrames > 0) pulseFrames--;
   M5.dis.setBrightness(atomBright);
 
-  // HEX ボードを drawpix より前に更新 (独立速度)
-  // (drawpix 内の FastLED.show() で HEX にも反映される)
+  // LED テープを drawpix より前に更新
+  // (drawpix 内の FastLED.show() でテープにも反映される)
   {
     uint32_t now = millis();
-    uint32_t hexInterval = (uint32_t)frameDelay * HEX_SPEED_SCALE / 256;
-    if (now - hexLastMs >= hexInterval) {
-      hexLastMs = now;
-      hexStep++;
-    }
-    updateHexDisplay(stage, hexStep, hexDimVal);
+    updateTapeDisplay(stage, now);
   }
 
   // 1. 全消灯
